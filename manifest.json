@@ -1,0 +1,18 @@
+
+{
+  "name": "JARVIS AI Assistant",
+  "short_name": "JARVIS",
+  "description": "Sci-fi inspired web assistant with persistence and offline UI capabilities.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#020617",
+  "theme_color": "#06b6d4",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3665/3665923.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -5,7 +5,10 @@ import HUD from './components/HUD';
 import ChatLog from './components/ChatLog';
 import { AssistantState, ChatMessage } from './types';
 import { getGeminiResponse, getGeminiSpeech } from './services/gemini';
-import { decodeBase64, decodeAudioData, createAudioContext } from './services/audio';
+import { decodeBase64, decodeAudioData, createAudioContext, playBeep } from './services/audio';
+
+const STORAGE_KEY = 'jarvis_history_v4';
+const THEME_KEY = 'jarvis_theme';
 
 const App: React.FC = () => {
   const [state, setState] = useState<AssistantState>('IDLE');
@@ -13,21 +16,68 @@ const App: React.FC = () => {
   const [history, setHistory] = useState<ChatMessage[]>([]);
   const [isAwake, setIsAwake] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [isOnline, setIsOnline] = useState(true);
+  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   
   const stateRef = useRef<AssistantState>('IDLE');
   const isAwakeRef = useRef<boolean>(false);
   const recognitionRef = useRef<any>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const activeAudioSource = useRef<AudioBufferSourceNode | null>(null);
-  // Fix: Use ReturnType<typeof setTimeout> instead of NodeJS.Timeout to avoid namespace errors in browser environment
   const wakeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isManuallyStoppingRef = useRef<boolean>(false);
+  const hasDetectedSpeechThisTurn = useRef<boolean>(false);
+
+  // Persistence: Load history and theme on mount
+  useEffect(() => {
+    const savedHistory = localStorage.getItem(STORAGE_KEY);
+    if (savedHistory) {
+      try {
+        setHistory(JSON.parse(savedHistory));
+      } catch (e) {
+        console.error("Failed to recover terminal history.");
+      }
+    }
+
+    const savedTheme = localStorage.getItem(THEME_KEY) as 'dark' | 'light';
+    if (savedTheme) {
+      setTheme(savedTheme);
+    }
+
+    const updateOnlineStatus = () => setIsOnline(navigator.onLine);
+    window.addEventListener('online', updateOnlineStatus);
+    window.addEventListener('offline', updateOnlineStatus);
+    updateOnlineStatus();
+
+    return () => {
+      window.removeEventListener('online', updateOnlineStatus);
+      window.removeEventListener('offline', updateOnlineStatus);
+    };
+  }, []);
+
+  // Apply theme class to body
+  useEffect(() => {
+    if (theme === 'light') {
+      document.body.classList.add('light');
+    } else {
+      document.body.classList.remove('light');
+    }
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  // Persistence: Save history whenever it changes
+  useEffect(() => {
+    if (history.length > 0) {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+    }
+  }, [history]);
 
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { isAwakeRef.current = isAwake; }, [isAwake]);
 
-  // Clean up on unmount
   useEffect(() => {
     return () => {
+      isManuallyStoppingRef.current = true;
       if (activeAudioSource.current) {
         try { activeAudioSource.current.stop(); } catch (e) {}
       }
@@ -35,14 +85,25 @@ const App: React.FC = () => {
         audioContextRef.current.close();
       }
       if (wakeTimeoutRef.current) clearTimeout(wakeTimeoutRef.current);
+      if (recognitionRef.current) {
+        recognitionRef.current.onend = null;
+        try { recognitionRef.current.stop(); } catch (e) {}
+      }
+      window.speechSynthesis.cancel();
     };
   }, []);
+
+  const toggleTheme = () => {
+    setTheme(prev => prev === 'dark' ? 'light' : 'dark');
+  };
 
   const handleStopVoice = () => {
     if (activeAudioSource.current) {
       try { activeAudioSource.current.stop(); } catch (e) {}
       activeAudioSource.current = null;
     }
+    window.speechSynthesis.cancel();
+    
     if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume();
     }
@@ -53,6 +114,17 @@ const App: React.FC = () => {
   };
 
   const handleTogglePauseVoice = async () => {
+    if (window.speechSynthesis.speaking) {
+      if (window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+        setIsPaused(false);
+      } else {
+        window.speechSynthesis.pause();
+        setIsPaused(true);
+      }
+      return;
+    }
+
     if (!audioContextRef.current) return;
     if (audioContextRef.current.state === 'running') {
       await audioContextRef.current.suspend();
@@ -63,10 +135,47 @@ const App: React.FC = () => {
     }
   };
 
+  const speakWithFallback = (text: string) => {
+    console.log("Switching to Browser Neural Vocalization (Fallback)...");
+    setState('SPEAKING');
+    
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    
+    const voices = window.speechSynthesis.getVoices();
+    const preferredVoice = voices.find(v => v.lang.includes('en-GB') && v.name.toLowerCase().includes('male')) 
+                         || voices.find(v => v.lang.includes('en-GB'))
+                         || voices[0];
+    
+    if (preferredVoice) utterance.voice = preferredVoice;
+    utterance.rate = 1.0;
+    utterance.pitch = 0.9;
+    
+    utterance.onend = () => {
+      setState('IDLE');
+      setTranscript('');
+      setIsAwake(false);
+      setIsPaused(false);
+    };
+
+    utterance.onerror = (e) => {
+      console.error("Local vocalization error:", e);
+      setState('IDLE');
+      setIsAwake(false);
+    };
+
+    window.speechSynthesis.speak(utterance);
+  };
+
   const playResponse = async (text: string) => {
     if (!text || text.trim().length === 0) {
       setState('IDLE');
       setIsAwake(false);
+      return;
+    }
+
+    if (!navigator.onLine) {
+      speakWithFallback(text);
       return;
     }
 
@@ -81,6 +190,7 @@ const App: React.FC = () => {
       setIsPaused(false);
       
       const audioData = await getGeminiSpeech(text);
+      
       if (audioData) {
         if (activeAudioSource.current) {
           try { activeAudioSource.current.stop(); } catch(e) {}
@@ -106,31 +216,35 @@ const App: React.FC = () => {
         source.start();
         activeAudioSource.current = source;
       } else {
-        setState('IDLE');
-        setIsAwake(false);
+        speakWithFallback(text);
       }
     } catch (err: any) {
-      console.error('Vocal projection failed:', err);
-      setState('ERROR');
-      setTranscript('Vocal matrix critical failure.');
-      setTimeout(() => {
-        setState('IDLE');
-        setIsAwake(false);
-        setTranscript('');
-      }, 5000);
+      const isQuotaError = err?.status === 429 || err?.error?.code === 429;
+      if (isQuotaError) {
+        console.warn('Gemini TTS Quota Exhausted. Using Browser Fallback.');
+        speakWithFallback(text);
+      } else {
+        console.error('Vocal projection failed:', err);
+        speakWithFallback(text);
+      }
     }
   };
 
   const processAICommand = async (command: string) => {
     if (!command || command.trim().length < 2) return;
     
-    // Clear wake timeout if we are actually processing a command
+    if (!navigator.onLine) {
+      const offlineMsg: ChatMessage = { role: 'assistant', content: "I am sorry, user. Neural link requires an active uplink to process complex commands. Connection lost.", timestamp: Date.now() };
+      setHistory(prev => [...prev, { role: 'user', content: command, timestamp: Date.now() }, offlineMsg]);
+      speakWithFallback(offlineMsg.content);
+      return;
+    }
+
     if (wakeTimeoutRef.current) {
       clearTimeout(wakeTimeoutRef.current);
       wakeTimeoutRef.current = null;
     }
 
-    // Stop current speaking if a new command comes in
     if (activeAudioSource.current) {
       try { activeAudioSource.current.stop(); } catch(e) {}
       activeAudioSource.current = null;
@@ -167,22 +281,22 @@ const App: React.FC = () => {
     const text = final.toLowerCase().trim();
     if (!text) return;
 
-    console.log('JARVIS Heard:', text);
+    if (audioContextRef.current) {
+      playBeep(audioContextRef.current, 'end');
+    }
+    hasDetectedSpeechThisTurn.current = false;
 
-    // If not awake, look for wake word
     if (!isAwakeRef.current) {
       if (text.includes('jarvis') || text.includes('hey jarvis')) {
         setIsAwake(true);
         setState('LISTENING');
         
-        // Check if there is a command following the wake word in the same transcript
         let command = text.split(/jarvis/i)[1]?.trim() || '';
         
         if (command.length > 2) {
           processAICommand(command);
         } else {
           setTranscript('Yes, user?');
-          // Set a timeout to go back to sleep if no follow-up
           if (wakeTimeoutRef.current) clearTimeout(wakeTimeoutRef.current);
           wakeTimeoutRef.current = setTimeout(() => {
             if (stateRef.current === 'LISTENING') {
@@ -194,9 +308,7 @@ const App: React.FC = () => {
         }
       }
     } else {
-      // If already awake and we're just listening for the command
       if (stateRef.current === 'LISTENING') {
-        // Strip wake word if repeated
         const cleanCommand = text.replace(/^(hey\s+)?jarvis[,?\s]*/i, '').trim();
         if (cleanCommand.length > 1) {
           processAICommand(cleanCommand);
@@ -213,84 +325,99 @@ const App: React.FC = () => {
       return;
     }
 
-    const startRecognition = () => {
-      try {
-        const recognition = new SpeechRecognition();
-        recognition.continuous = true;
-        recognition.interimResults = true;
-        recognition.lang = 'en-US';
+    const initRecognition = () => {
+      if (isManuallyStoppingRef.current) return;
 
-        recognition.onresult = (event: any) => {
-          let interimTranscript = '';
-          for (let i = event.resultIndex; i < event.results.length; ++i) {
-            const result = event.results[i];
-            if (result.isFinal) {
-              handleFinalTranscript(result[0].transcript);
-            } else {
-              interimTranscript += result[0].transcript;
-              // Only show interim if we are actually awake or listening
-              if (isAwakeRef.current || interimTranscript.toLowerCase().includes('jarvis')) {
-                setTranscript(interimTranscript);
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (event: any) => {
+        let interimTranscript = '';
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          const result = event.results[i];
+          if (result.isFinal) {
+            handleFinalTranscript(result[0].transcript);
+          } else {
+            interimTranscript += result[0].transcript;
+            if (isAwakeRef.current || interimTranscript.toLowerCase().includes('jarvis')) {
+              setTranscript(interimTranscript);
+              
+              if (isAwakeRef.current && !hasDetectedSpeechThisTurn.current && interimTranscript.trim().length > 0) {
+                hasDetectedSpeechThisTurn.current = true;
+                if (audioContextRef.current) {
+                  playBeep(audioContextRef.current, 'detect');
+                }
               }
             }
           }
-        };
+        }
+      };
 
-        recognition.onerror = (event: any) => {
-          console.error('Recognition error:', event.error);
-          if (event.error === 'no-speech') return;
-          if (event.error === 'not-allowed') {
-            setState('ERROR');
-            setTranscript('Mic access denied.');
-            return;
-          }
-        };
+      recognition.onerror = (event: any) => {
+        const error = event.error;
+        if (error === 'no-speech' || error === 'audio-capture' || error === 'aborted') {
+          return;
+        }
+        if (error === 'not-allowed') {
+          setState('ERROR');
+          setTranscript('Mic access denied.');
+        }
+      };
 
-        recognition.onend = () => {
-          // Restart recognition unless it's a critical error
-          if (stateRef.current !== 'ERROR') {
-            setTimeout(() => {
-              try { recognition.start(); } catch (e) {}
-            }, 100);
-          }
-        };
+      recognition.onend = () => {
+        if (stateRef.current !== 'ERROR' && !isManuallyStoppingRef.current) {
+          setTimeout(initRecognition, 250);
+        }
+      };
 
-        recognitionRef.current = recognition;
+      recognitionRef.current = recognition;
+      try {
         recognition.start();
-      } catch (e) {
-        console.error('Failed to initialize recognition:', e);
-      }
+      } catch (e) {}
     };
 
-    startRecognition();
+    initRecognition();
 
     return () => {
+      isManuallyStoppingRef.current = true;
       if (recognitionRef.current) {
         recognitionRef.current.onend = null;
-        recognitionRef.current.stop();
+        try { recognitionRef.current.stop(); } catch (e) {}
       }
     };
   }, []);
 
-  const handleManualActivation = () => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = createAudioContext();
-    }
-    
-    if (audioContextRef.current.state === 'suspended') {
-      audioContextRef.current.resume();
-    }
+  const handleMicToggle = () => {
+    if (state === 'LISTENING') {
+      setState('IDLE');
+      setIsAwake(false);
+      setTranscript('');
+      if (wakeTimeoutRef.current) clearTimeout(wakeTimeoutRef.current);
+      if (audioContextRef.current) {
+        playBeep(audioContextRef.current, 'end');
+      }
+    } else {
+      if (!audioContextRef.current) {
+        audioContextRef.current = createAudioContext();
+      }
+      if (audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume();
+      }
+      playBeep(audioContextRef.current, 'start');
 
-    if (state === 'IDLE' || state === 'SPEAKING' || state === 'ERROR') {
       if (activeAudioSource.current) {
         try { activeAudioSource.current.stop(); } catch(e) {}
         activeAudioSource.current = null;
       }
+      window.speechSynthesis.cancel();
+      
       setIsAwake(true);
       setState('LISTENING');
-      setTranscript('Listening...');
+      setTranscript('');
+      hasDetectedSpeechThisTurn.current = false;
       
-      // Auto-sleep timer for manual activation too
       if (wakeTimeoutRef.current) clearTimeout(wakeTimeoutRef.current);
       wakeTimeoutRef.current = setTimeout(() => {
         if (stateRef.current === 'LISTENING') {
@@ -298,36 +425,56 @@ const App: React.FC = () => {
           setIsAwake(false);
           setTranscript('');
         }
-      }, 8000);
+      }, 15000);
+    }
+  };
+
+  const clearHistory = () => {
+    if (confirm("Initiate memory wipe? This will erase all stored data points.")) {
+      setHistory([]);
+      localStorage.removeItem(STORAGE_KEY);
     }
   };
 
   return (
-    <div className="relative w-screen h-screen flex flex-col items-center justify-center bg-slate-950 text-cyan-400 overflow-hidden">
-      <div className="absolute inset-0 z-0 opacity-20 pointer-events-none">
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] border border-cyan-500/20 rounded-full" />
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] border border-cyan-500/10 rounded-full" />
+    <div className={`relative w-screen h-screen flex flex-col items-center justify-center transition-colors duration-700 ${theme === 'dark' ? 'bg-slate-950 text-cyan-400' : 'bg-slate-50 text-cyan-700'} overflow-hidden`}>
+      <div className={`absolute inset-0 z-0 opacity-20 pointer-events-none transition-colors duration-700 ${theme === 'dark' ? 'text-cyan-500' : 'text-cyan-600'}`}>
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] border border-current opacity-20 rounded-full" />
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] border border-current opacity-10 rounded-full" />
       </div>
 
-      <JarvisOrb state={state} />
+      <JarvisOrb state={state} theme={theme} />
       
-      <button 
-        onClick={handleManualActivation}
-        className="mt-12 z-30 group flex flex-col items-center gap-2 pointer-events-auto"
-      >
-        <span className="text-[10px] uppercase tracking-[0.3em] font-orbitron text-cyan-500/60 group-hover:text-cyan-400 transition-colors">
-          {state === 'ERROR' ? 'Matrix Error' : isAwake ? 'Listening Mode' : 'Manual Signal'}
-        </span>
-        <div className="w-8 h-1 bg-cyan-500/20 rounded-full overflow-hidden">
-          <div className={`h-full transition-all duration-300 ${state === 'ERROR' ? 'bg-red-500 w-full' : isAwake ? 'bg-cyan-500 w-full' : 'bg-cyan-500 w-0'}`} />
-        </div>
-      </button>
+      <div className="flex flex-col items-center gap-4 mt-12 z-30">
+        <button 
+          onClick={handleMicToggle}
+          className="group flex flex-col items-center gap-2 pointer-events-auto"
+        >
+          <span className={`text-[10px] uppercase tracking-[0.3em] font-orbitron transition-colors ${theme === 'dark' ? 'text-cyan-500/60 group-hover:text-cyan-400' : 'text-cyan-700/60 group-hover:text-cyan-600'}`}>
+            {state === 'ERROR' ? 'Matrix Error' : isAwake ? 'Active Uplink' : 'Manual Signal'}
+          </span>
+          <div className={`w-8 h-1 rounded-full overflow-hidden transition-colors ${theme === 'dark' ? 'bg-cyan-500/20' : 'bg-cyan-700/10'}`}>
+            <div className={`h-full transition-all duration-300 ${state === 'ERROR' ? 'bg-red-500 w-full' : isAwake ? (theme === 'dark' ? 'bg-cyan-500 w-full' : 'bg-cyan-600 w-full') : 'bg-cyan-500 w-0'}`} />
+          </div>
+        </button>
+
+        {history.length > 0 && (
+          <button 
+            onClick={clearHistory}
+            className={`text-[8px] font-orbitron uppercase tracking-widest transition-colors ${theme === 'dark' ? 'text-red-500/40 hover:text-red-400' : 'text-red-600/40 hover:text-red-500'} pointer-events-auto`}
+          >
+            [ Memory Wipe ]
+          </button>
+        )}
+      </div>
 
       <ChatLog 
         history={history} 
         state={state} 
-        onMicClick={handleManualActivation} 
+        transcript={transcript}
+        onMicClick={handleMicToggle} 
         onSendMessage={processAICommand}
+        theme={theme}
       />
       
       <HUD 
@@ -337,12 +484,14 @@ const App: React.FC = () => {
         isPaused={isPaused}
         onStopVoice={handleStopVoice}
         onTogglePauseVoice={handleTogglePauseVoice}
+        theme={theme}
+        onToggleTheme={toggleTheme}
       />
       
       <div className="absolute bottom-4 left-4 text-[8px] opacity-30 font-orbitron space-y-1">
         <div>SYS_OS: JARVIS_FLASH_OS</div>
-        <div>UPLINK: HYPER_SPEED</div>
-        <div>MIC_STATUS: ACTIVE</div>
+        <div>UPLINK: {isOnline ? 'HYPER_SPEED' : 'LINK_LOST'}</div>
+        <div>PERSISTENCE: {history.length > 0 ? 'SYNCHRONIZED' : 'STANDBY'}</div>
       </div>
     </div>
   );
