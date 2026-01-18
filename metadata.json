@@ -1,0 +1,7 @@
+{
+  "name": "JARVIS – Web AI Assistant",
+  "description": "A sci-fi inspired web assistant with wake-word detection, real-time search, and high-quality voice output powered by Gemini.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
